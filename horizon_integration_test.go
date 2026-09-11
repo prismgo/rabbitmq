@@ -2,224 +2,71 @@ package rabbitmq
 
 import (
 	"context"
-	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
-
-	qcontract "github.com/prismgo/framework/contracts/queue"
-	"github.com/prismgo/framework/event"
-	"github.com/prismgo/framework/foundation"
-	"github.com/prismgo/framework/horizon"
-	"github.com/prismgo/framework/kernel"
-	"github.com/prismgo/framework/queue"
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 const horizonIntegrationRabbitMQEnv = "PRISMGO_RABBITMQ_TEST_URL"
+const horizonIntegrationRabbitMQNameEnv = "PRISMGO_RABBITMQ_HORIZON_TEST_NAME"
 
 func TestRabbitMQHorizonIntegrationGateSkipsUnsupportedFailedAndBatchState(t *testing.T) {
-	// 需求背景：RabbitMQ driver 当前不承载 failed job 和 batch 持久状态，Horizon integration contract 要求这类
-	// Prismgo driver 能力差异被明确记录，不能作为 Horizon 集成门失败条件。该测试只验证
-	// RabbitMQ job 消费会进入 Horizon metrics/control/store 边界。
-	ctx := context.Background()
-	url := strings.TrimSpace(os.Getenv(horizonIntegrationRabbitMQEnv))
-	if url == "" {
+	if strings.TrimSpace(os.Getenv(horizonIntegrationRabbitMQEnv)) == "" {
 		t.Skipf("%s is not set; skipping RabbitMQ Horizon integration gate", horizonIntegrationRabbitMQEnv)
 	}
-	name := fmt.Sprintf("prismgo.horizon.horizon_integration.%d", time.Now().UnixNano())
-	exchange := name + ".exchange"
-	queueName := name + ".queue"
-	restartQueue := name + ".restart"
-	t.Cleanup(func() { cleanupHorizonIntegrationRabbitMQ(t, url, exchange, queueName, restartQueue) })
+	ctx, cancel := horizonIntegrationContext(t)
+	defer cancel()
 
-	queueManager, err := newHorizonIntegrationRabbitMQQueueManager(url, exchange, queueName, restartQueue)
-	if err != nil {
-		t.Fatalf("new rabbitmq queue manager: %v", err)
+	if output, err := exec.CommandContext(ctx, "go", "list", "-m", "github.com/prismgo/horizon").CombinedOutput(); err != nil {
+		t.Skipf("github.com/prismgo/horizon is not installed; skipping RabbitMQ Horizon integration gate: %s", strings.TrimSpace(string(output)))
 	}
-	t.Cleanup(func() {
-		if err := queueManager.Close(); err != nil {
-			t.Logf("close rabbitmq queue manager: %v", err)
-		}
-	})
+	fixture := newRabbitMQIntegrationFixture(t, "horizon_integration")
 
-	app := foundation.NewApplication()
-	t.Cleanup(func() { _ = app.Close() })
-	if err := app.Instance("queue.manager", queueManager); err != nil {
-		t.Fatalf("bind queue manager: %v", err)
+	fixturePath := filepath.Join(t.TempDir(), "horizon-integration.test")
+	if runtime.GOOS == "windows" {
+		fixturePath += ".exe"
 	}
-	bus := event.New()
-	if err := app.Instance("event.dispatcher", bus); err != nil {
-		t.Fatalf("register event dispatcher: %v", err)
-	}
-	if err := (queue.ServiceProvider{}).Boot(app); err != nil {
-		t.Fatalf("boot queue provider bridge: %v", err)
-	}
-	if err := (ServiceProvider{}).Boot(app); err != nil {
-		t.Fatalf("boot rabbitmq extension provider: %v", err)
-	}
-	t.Cleanup(func() { queue.UseEventSink(nil) })
-
-	store := horizon.NewMemoryStore(horizon.StoreOptions{Prefix: "horizon_integration_rabbitmq", HeartbeatTTL: time.Minute})
-	manager, err := horizon.NewManager(horizonIntegrationConfig("memory", "rabbitmq", queueName),
-		horizon.WithStoreFactory(horizonIntegrationStaticStore{store: store}),
-		horizon.WithQueueManager(horizon.NewQueueAdapter(queueManager)),
-		horizon.WithWorkerRunner(horizon.NewQueueWorkerAdapter(queueManager)),
-		horizon.WithEventDispatcher(bus),
+	compile := exec.CommandContext(
+		ctx,
+		"go", "test", "-c", "-o", fixturePath, "./testdata/horizon_integration",
 	)
+	compile.Env = os.Environ()
+	output, err := compile.CombinedOutput()
 	if err != nil {
-		t.Fatalf("new rabbitmq horizon manager: %v", err)
-	}
-	if err := manager.RegisterMonitor(ctx); err != nil {
-		t.Fatalf("register horizon monitor: %v", err)
+		t.Fatalf("compile installed Horizon integration fixture: %v\n%s", err, output)
 	}
 
-	if _, err := queue.NewDispatcher(queueManager).Dispatch(ctx, &horizonIntegrationJob{Value: "rabbitmq"}, queue.OnQueue(queueName)); err != nil {
-		t.Fatalf("dispatch rabbitmq job: %v", err)
-	}
-	rabbitOpts := queue.WorkerOptions{
-		Connection: "rabbitmq",
-		Queues:     []string{queueName},
-		Once:       true,
-		Tries:      1,
-	}
-	rabbitSession, err := manager.WorkerRunner().Begin(ctx, rabbitOpts)
+	run := exec.CommandContext(
+		ctx,
+		fixturePath,
+		"-test.run", "^TestRabbitMQHorizonIntegration$",
+		"-test.count=1",
+		"-test.v",
+		"-test.timeout=2m",
+	)
+	run.Env = append(os.Environ(), horizonIntegrationRabbitMQNameEnv+"="+fixture.name)
+	output, err = run.CombinedOutput()
 	if err != nil {
-		t.Fatalf("begin rabbitmq worker session: %v", err)
+		t.Fatalf("run installed Horizon integration fixture: %v\n%s", err, output)
 	}
-	defer func() {
-		if err := rabbitSession.Close(); err != nil {
-			t.Errorf("close rabbit session: %v", err)
-		}
-	}()
-	if err := rabbitSession.Activate(ctx); err != nil {
-		t.Fatalf("activate rabbitmq worker session: %v", err)
-	}
-	if err := rabbitSession.Work(ctx); err != nil {
-		t.Fatalf("work rabbitmq job once: %v", err)
-	}
-
-	if err := app.Instance("horizon.manager", manager); err != nil {
-		t.Fatalf("bind rabbitmq horizon manager: %v", err)
-	}
-	k := kernel.New("rabbitmq-horizon-integration")
-	for _, factory := range horizon.CommandFactories() {
-		k.Register(factory())
-	}
-	if err := k.CallSilently(ctx, "horizon:snapshot"); err != nil {
-		t.Fatalf("snapshot rabbitmq integration: %v", err)
-	}
-	windows, err := store.EventMetricWindows(ctx, horizon.EventMetricWindowQuery{})
-	if err != nil {
-		t.Fatalf("read rabbitmq metrics: %v", err)
-	}
-	processed := int64(0)
-	for _, window := range windows.Items {
-		processed += window.Processed
-	}
-	lengths, err := store.QueueLengthSnapshot(ctx)
-	if err != nil {
-		t.Fatalf("read rabbitmq queue lengths: %v", err)
-	}
-	if processed != 1 || len(lengths.Queues) != 1 {
-		t.Fatalf("rabbitmq snapshot = processed %d queue lengths %d, want 1 and 1", processed, len(lengths.Queues))
-	}
-	if err := k.CallSilently(ctx, "horizon:terminate"); err != nil {
-		t.Fatalf("request rabbitmq horizon terminate: %v", err)
-	}
+	t.Logf("installed Horizon integration fixture passed:\n%s", output)
 }
 
-type horizonIntegrationStaticStore struct {
-	store horizon.Store
-}
-
-func (r horizonIntegrationStaticStore) ResolveStore(context.Context, horizon.Config) (horizon.Store, error) {
-	return r.store, nil
-}
-
-type horizonIntegrationJob struct {
-	Value string
-}
-
-func (j *horizonIntegrationJob) Handle(context.Context) error {
-	return nil
-}
-
-func horizonIntegrationConfig(storeName, connection, queueName string) horizon.Config {
-	return horizon.Config{
-		Store:        storeName,
-		Environment:  "local",
-		HeartbeatTTL: time.Minute,
-		Supervisors: map[string]horizon.SupervisorConfig{
-			"supervisor-default": {
-				Name:       "supervisor-default",
-				Connection: connection,
-				Queues:     []string{queueName},
-			},
-		},
-	}
-}
-
-func newHorizonIntegrationRabbitMQQueueManager(url, exchange, queueName, restartQueue string) (*queue.Manager, error) {
-	registry := queue.NewRegistry()
-	queue.RegisterTypeTo[*horizonIntegrationJob](registry)
-	manager, err := queue.NewManager(queue.Config{
-		Default: "rabbitmq",
-		Connections: map[string]queue.ConnectionConfig{
-			"rabbitmq": {
-				Driver:   "rabbitmq",
-				Queue:    queueName,
-				BlockFor: 2 * time.Second,
-				Options: map[string]any{
-					"url":                url,
-					"exchange":           exchange,
-					"exchange_type":      "direct",
-					"declare":            true,
-					"exchange_durable":   false,
-					"queue_durable":      false,
-					"message_persistent": false,
-					"confirm":            true,
-					"prefetch":           1,
-					"publish_timeout":    2 * time.Second,
-					"restart_queue":      restartQueue,
-					"restart_enabled":    true,
-				},
-			},
-		},
-	}, registry)
-	if err != nil {
-		return nil, err
-	}
-	manager.Extend("rabbitmq", func() (qcontract.Connector, error) {
-		return Connector{}, nil
-	})
-	return manager, nil
-}
-
-func cleanupHorizonIntegrationRabbitMQ(t *testing.T, url, exchange, queueName, restartQueue string) {
+func horizonIntegrationContext(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		t.Logf("dial rabbitmq cleanup: %v", err)
-		return
-	}
-	defer func() {
-		if err := conn.Close(); err != nil {
-			t.Errorf("close rabbitmq connection: %v", err)
+
+	if deadline, ok := t.Deadline(); ok {
+		deadline = deadline.Add(-5 * time.Second)
+		if !deadline.After(time.Now()) {
+			t.Fatal("RabbitMQ Horizon integration gate has no time remaining before the test deadline")
 		}
-	}()
-	ch, err := conn.Channel()
-	if err != nil {
-		t.Logf("open rabbitmq cleanup channel: %v", err)
-		return
+
+		return context.WithDeadline(t.Context(), deadline)
 	}
-	defer func() {
-		if err := ch.Close(); err != nil {
-			t.Errorf("close rabbitmq channel: %v", err)
-		}
-	}()
-	_, _ = ch.QueueDelete(queueName, false, false, false)
-	_, _ = ch.QueueDelete(restartQueue, false, false, false)
-	_ = ch.ExchangeDelete(exchange, false, false)
+
+	return context.WithTimeout(t.Context(), 2*time.Minute)
 }
