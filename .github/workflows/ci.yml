@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out extension
+        uses: actions/checkout@v4
+        with:
+          path: rabbitmq
+
+      - name: Check out framework
+        uses: actions/checkout@v4
+        with:
+          repository: prismgo/framework
+          path: framework
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: rabbitmq/go.sum
+
+      - name: Verify declared module dependencies
+        working-directory: rabbitmq
+        env:
+          GOWORK: "off"
+        run: go build ./...
+
+      - name: Create workspace
+        run: go work init ./framework ./rabbitmq
+
+      - name: Test with race detector and real RabbitMQ
+        working-directory: rabbitmq
+        env:
+          PRISMGO_RABBITMQ_TEST_URL: amqp://guest:guest@127.0.0.1:5672/
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Enforce 90 percent statement coverage
+        working-directory: rabbitmq
+        run: |
+          coverage=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
+          awk -v coverage="$coverage" 'BEGIN { if (coverage + 0 < 90) exit 1 }'
