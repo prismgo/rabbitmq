@@ -1,6 +1,6 @@
 module github.com/prismgo/rabbitmq
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/prismgo/framework v0.2.3-0.20260911074405-34e228c170c2
